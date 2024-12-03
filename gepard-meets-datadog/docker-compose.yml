@@ -1,0 +1,301 @@
+x-java-entrypoint: &java_entrypoint
+  - "java"
+  - "-javaagent:/agent/inspectit-gepard-agent.jar"
+  - "-Dinspectit.config.http.url=http://inspectit-gepard-configserver:8080/api/v1"
+  - "org.springframework.boot.loader.launch.JarLauncher"
+
+volumes:
+  agent-vol:
+
+services:
+  # inspectIT Gepard
+  agent:
+    image: inspectit/inspectit-gepard-agent:master
+    container_name: agent
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    depends_on:
+      inspectit-configserver:
+        condition: service_healthy
+    volumes:
+      - agent-vol:/agent
+
+  inspectit-configserver:
+    image: inspectit/inspectit-gepard-configserver:main
+    container_name: inspectit-gepard-configserver
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    volumes:
+      - ./example-config.json:/.config/configuration.json
+    ports:
+      - 8080:8080
+      - 8091:9090
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "--Insecure",
+          "http://inspectit-configserver:9090/actuator/swagger-ui",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Data collection
+  otelcol:
+    image: otel/opentelemetry-collector-contrib:0.114.0
+    container_name: otelcol
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 200M
+    command: [ "--config=/etc/otelcol-config.yml" ]
+    user: 0:0
+    volumes:
+      - ./otelcol-config.yml:/etc/otelcol-config.yml
+    ports:
+      - 4317
+      - 4318
+
+  # TODO remove jaeger
+  jaeger:
+    image: jaegertracing/all-in-one:1.63.0
+    container_name: jaeger
+    restart: unless-stopped
+    command:
+      - "--memory.max-traces=5000"
+      - "--query.base-path=/jaeger/ui"
+    deploy:
+      resources:
+        limits:
+          memory: 400M
+    ports:
+      - 16686:16686
+
+  # Demo application: Spring PetClinic
+  config-server:
+    image: inspectit/spring-petclinic-config-server:latest
+    container_name: config-server
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    depends_on:
+      agent:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-I", "http://config-server:8888"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - agent-vol:/agent
+    entrypoint: *java_entrypoint
+    ports:
+      - 8888:8888
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otelcol:4318
+      - OTEL_SERVICE_NAME=config-server
+      - INSPECTIT_CONFIG_HTTP_ATTRIBUTES_APPLICATION=petclinic
+      - INSPECTIT_CONFIG_HTTP_ATTRIBUTES_ROLE=operation
+
+  discovery-server:
+    image: inspectit/spring-petclinic-discovery-server:latest
+    container_name: discovery-server
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://discovery-server:8761"]
+      interval: 20s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      config-server:
+        condition: service_healthy
+    volumes:
+      - agent-vol:/agent
+    entrypoint: *java_entrypoint
+    ports:
+      - 8761:8761
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otelcol:4318
+      - OTEL_SERVICE_NAME=discovery-service
+      - INSPECTIT_CONFIG_HTTP_ATTRIBUTES_APPLICATION=petclinic
+      - INSPECTIT_CONFIG_HTTP_ATTRIBUTES_ROLE=operation
+
+  api-gateway:
+    image: inspectit/spring-petclinic-api-gateway:latest
+    container_name: api-gateway
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    depends_on:
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+    ports:
+      - 8099:8080
+    volumes:
+      - agent-vol:/agent
+    entrypoint: *java_entrypoint
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otelcol:4318
+      - OTEL_SERVICE_NAME=api-gateway
+      - INSPECTIT_CONFIG_HTTP_ATTRIBUTES_APPLICATION=petclinic
+      - INSPECTIT_CONFIG_HTTP_ATTRIBUTES_ROLE=business
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://api-gateway:8080/actuator/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+
+  customers-service:
+    image: inspectit/spring-petclinic-customers-service:latest
+    container_name: customers-service
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    depends_on:
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+    healthcheck:
+      test:
+        ["CMD", "curl", "-f", "http://customers-service:8081/actuator/health"]
+      interval: 20s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - agent-vol:/agent
+    entrypoint: *java_entrypoint
+    ports:
+      - 8081:8081
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otelcol:4318
+      - OTEL_SERVICE_NAME=customers-service
+      - INSPECTIT_CONFIG_HTTP_ATTRIBUTES_APPLICATION=petclinic
+      - INSPECTIT_CONFIG_HTTP_ATTRIBUTES_ROLE=business
+
+  visits-service:
+    image: inspectit/spring-petclinic-visits-service:latest
+    container_name: visits-service
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    depends_on:
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://visits-service:8082/actuator/health"]
+      interval: 20s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - agent-vol:/agent
+    entrypoint: *java_entrypoint
+    ports:
+      - 8082:8082
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otelcol:4318
+      - OTEL_SERVICE_NAME=visits-service
+      - INSPECTIT_CONFIG_HTTP_ATTRIBUTES_APPLICATION=petclinic
+      - INSPECTIT_CONFIG_HTTP_ATTRIBUTES_ROLE=business
+
+  vets-service:
+    image: inspectit/spring-petclinic-vets-service:latest
+    container_name: vets-service
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    depends_on:
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://vets-service:8083/actuator/health"]
+      interval: 20s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - agent-vol:/agent
+    entrypoint: *java_entrypoint
+    ports:
+      - 8083:8083
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otelcol:4318
+      - OTEL_SERVICE_NAME=vets-service
+      - INSPECTIT_CONFIG_HTTP_ATTRIBUTES_APPLICATION=petclinic
+      - INSPECTIT_CONFIG_HTTP_ATTRIBUTES_ROLE=business
+
+  admin-server:
+    image: inspectit/spring-petclinic-admin-server:latest
+    container_name: admin-server
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    depends_on:
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+    ports:
+      - 9000:9090
+
+  # Load generator to create traffic data
+  loadgenerator:
+    container_name: loadgenerator
+    restart: unless-stopped
+    build:
+      context: loadgenerator
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    ports:
+      - 8089:8089
+    environment:
+      - LOCUST_WEB_PORT=8089
+      - LOCUST_WEB_HOST=0.0.0.0
+      - LOCUST_HOST=http://api-gateway:8080
+      - LOCUST_USERS
+      - LOCUST_HEADLESS
+      - LOCUST_AUTOSTART
+      - LOCUST_BROWSER_TRAFFIC_ENABLED=true
+      - PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+      customers-service:
+        condition: service_healthy
+      visits-service:
+        condition: service_healthy
+      vets-service:
+        condition: service_healthy

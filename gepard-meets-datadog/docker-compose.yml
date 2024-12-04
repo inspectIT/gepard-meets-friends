@@ -60,26 +60,13 @@ services:
           memory: 200M
     command: [ "--config=/etc/otelcol-config.yml" ]
     user: 0:0
+    environment:
+      - DD_API_KEY
     volumes:
       - ./otelcol-config.yml:/etc/otelcol-config.yml
     ports:
       - 4317
       - 4318
-
-  # TODO remove jaeger
-  jaeger:
-    image: jaegertracing/all-in-one:1.63.0
-    container_name: jaeger
-    restart: unless-stopped
-    command:
-      - "--memory.max-traces=5000"
-      - "--query.base-path=/jaeger/ui"
-    deploy:
-      resources:
-        limits:
-          memory: 400M
-    ports:
-      - 16686:16686
 
   # Demo application: Spring PetClinic
   config-server:
